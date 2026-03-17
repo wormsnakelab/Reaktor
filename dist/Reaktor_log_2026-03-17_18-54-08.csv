@@ -1,0 +1,1 @@
+pc_time,frame_index,frame_type,mode_num,mode_name,input_mv,input_v,battery_mv,battery_v,current_cA,current_a,mah,cell1_mv,cell1_v,cell2_mv,cell2_v,cell3_mv,cell3_v,cell4_mv,cell4_v,cell5_mv,cell5_v,cell6_mv,cell6_v,cell_delta_mv,cell_delta_v,temp_raw,temp_c,status,status_bin,unknown_value,unknown_value_bin,raw_line
