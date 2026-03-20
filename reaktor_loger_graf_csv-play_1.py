@@ -95,6 +95,88 @@ class FrameData:
         return f"{self.unknown_value:08b}" if self.unknown_value is not None else "-"
 
 
+class CellGauge(ttk.Frame):
+    SCALE_MIN_V = 3.0
+    SCALE_MAX_V = 4.3
+
+    def __init__(self, master: tk.Misc, title: str):
+        super().__init__(master, padding=(6, 4))
+        self.title = title
+        self.width = 54
+        self.height = 150
+
+        self.label_var = tk.StringVar(value=f"{title}\n-")
+        ttk.Label(self, textvariable=self.label_var, justify="center", width=8).pack()
+
+        self.canvas = tk.Canvas(
+            self,
+            width=self.width,
+            height=self.height,
+            highlightthickness=0,
+            bg="#f5f6f7",
+        )
+        self.canvas.pack()
+
+        self._draw_static()
+        self.set_value(None)
+
+    def _draw_static(self) -> None:
+        left = 16
+        top = 10
+        right = self.width - 16
+        bottom = self.height - 10
+        self.bar_coords = (left, top, right, bottom)
+        self.canvas.create_rectangle(left, top, right, bottom, outline="#4a4a4a", width=2)
+
+        for voltage in (3.0, 3.5, 4.0, 4.2):
+            y = self._y_from_value(voltage)
+            self.canvas.create_line(right + 2, y, right + 8, y, fill="#6f7782")
+            self.canvas.create_text(right + 20, y, text=f"{voltage:.1f}", fill="#6f7782", font=("TkDefaultFont", 8))
+
+    def _y_from_value(self, value_v: float) -> float:
+        value_v = min(max(value_v, self.SCALE_MIN_V), self.SCALE_MAX_V)
+        top = self.bar_coords[1]
+        bottom = self.bar_coords[3]
+        ratio = (value_v - self.SCALE_MIN_V) / (self.SCALE_MAX_V - self.SCALE_MIN_V)
+        return bottom - ratio * (bottom - top)
+
+    def set_value(self, value_v: Optional[float]) -> None:
+        self.canvas.delete("dynamic")
+        left, top, right, bottom = self.bar_coords
+
+        if value_v is None or value_v <= 0:
+            self.canvas.create_rectangle(left + 1, top + 1, right - 1, bottom - 1, fill="#d8dce1", width=0, tags="dynamic")
+            self.canvas.create_text(
+                (left + right) / 2,
+                (top + bottom) / 2,
+                text="OFF",
+                fill="#6b7280",
+                font=("TkDefaultFont", 9, "bold"),
+                tags="dynamic",
+            )
+            self.label_var.set(f"{self.title}\n-")
+            return
+
+        y = self._y_from_value(value_v)
+        color = "#c97a12"
+        if value_v >= 4.15:
+            color = "#2d9c5a"
+        elif value_v <= 3.3:
+            color = "#c23b22"
+
+        self.canvas.create_rectangle(left + 1, y, right - 1, bottom - 1, fill=color, width=0, tags="dynamic")
+        self.canvas.create_line(left - 4, y, right + 4, y, fill="#202020", width=2, tags="dynamic")
+        self.canvas.create_text(
+            (left + right) / 2,
+            max(top + 12, y - 10),
+            text=f"{value_v:.3f}V",
+            fill="#202020",
+            font=("TkDefaultFont", 8, "bold"),
+            tags="dynamic",
+        )
+        self.label_var.set(f"{self.title}\n{value_v:.3f} V")
+
+
 class SerialWorker(threading.Thread):
     def __init__(self, port: str, out_queue: queue.Queue):
         super().__init__(daemon=True)
@@ -308,6 +390,8 @@ class App:
 
         grid = ttk.LabelFrame(self.root, text="Live values", padding=10)
         grid.pack(fill="x", padx=10, pady=6)
+        grid.columnconfigure(0, weight=1)
+        grid.columnconfigure(1, weight=0)
 
         self.value_vars = {
             "frame_index": tk.StringVar(value="-"),
@@ -351,11 +435,24 @@ class App:
             ("Cell6", "cell6"),
         ]
 
+        values_frame = ttk.Frame(grid)
+        values_frame.grid(row=0, column=0, sticky="nw")
+
         for i, (label, key) in enumerate(pairs):
             r = i // 3
             c = (i % 3) * 2
-            ttk.Label(grid, text=label + ":").grid(row=r, column=c, sticky="w", padx=(0, 8), pady=2)
-            ttk.Label(grid, textvariable=self.value_vars[key], width=24).grid(row=r, column=c + 1, sticky="w", pady=2)
+            ttk.Label(values_frame, text=label + ":").grid(row=r, column=c, sticky="w", padx=(0, 8), pady=2)
+            ttk.Label(values_frame, textvariable=self.value_vars[key], width=24).grid(row=r, column=c + 1, sticky="w", pady=2)
+
+        gauges_frame = ttk.LabelFrame(grid, text="Cell gauges", padding=8)
+        gauges_frame.grid(row=0, column=1, sticky="ne", padx=(16, 0))
+
+        self.cell_gauges: dict[str, CellGauge] = {}
+        for index in range(1, 7):
+            key = f"cell{index}"
+            gauge = CellGauge(gauges_frame, f"C{index}")
+            gauge.grid(row=(index - 1) // 3, column=(index - 1) % 3, padx=4, pady=4, sticky="n")
+            self.cell_gauges[key] = gauge
 
         plot_frame = ttk.LabelFrame(self.root, text="Live history plot", padding=6)
         plot_frame.pack(fill="both", expand=False, padx=10, pady=6)
@@ -479,6 +576,8 @@ class App:
         self.log.delete("1.0", "end")
         for key in self.value_vars:
             self.value_vars[key].set("-")
+        for gauge in self.cell_gauges.values():
+            gauge.set_value(None)
 
     def start_new_session(self) -> None:
         self.stop_playback()
@@ -785,7 +884,7 @@ class App:
         self.value_vars["capacity"].set(f"{d.mah} mAh" if d.mah is not None else "-")
         self.value_vars["unknown_value"].set(str(d.unknown_value) if d.unknown_value is not None else "-")
         self.value_vars["unknown_value_bin"].set(d.unknown_value_bin)
-        self.value_vars["temp"].set(f"{d.temp_c:.1f} °C ?" if d.temp_c is not None else "-")
+        self.value_vars["temp"].set(f"{d.temp_c:.1f} degC ?" if d.temp_c is not None else "-")
         self.value_vars["status"].set(str(d.status) if d.status is not None else "-")
         self.value_vars["status_bin"].set(d.status_bin)
         self.value_vars["delta"].set(f"{d.cell_delta_v:.3f} V" if d.cell_delta_v is not None else "-")
@@ -795,6 +894,10 @@ class App:
         self.value_vars["cell4"].set(fmt_v(d.cell4_mv))
         self.value_vars["cell5"].set(fmt_v(d.cell5_mv))
         self.value_vars["cell6"].set(fmt_v(d.cell6_mv))
+        for index in range(1, 7):
+            cell_mv = getattr(d, f"cell{index}_mv")
+            cell_v = cell_mv / 1000 if cell_mv is not None and cell_mv > 0 else None
+            self.cell_gauges[f"cell{index}"].set_value(cell_v)
 
     def add_tree_row(self, d: FrameData) -> None:
         self.tree.insert("", 0, values=(

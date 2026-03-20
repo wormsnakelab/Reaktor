@@ -1,4 +1,5 @@
 import csv
+import math
 import queue
 import threading
 import time
@@ -93,6 +94,136 @@ class FrameData:
     @property
     def unknown_value_bin(self) -> str:
         return f"{self.unknown_value:08b}" if self.unknown_value is not None else "-"
+
+
+class CellGauge(ttk.Frame):
+    SCALE_MIN_V = 0.0
+    SCALE_MAX_V = 5.0
+    ROTATION_DEG = 50.0
+
+    def __init__(self, master: tk.Misc, title: str):
+        super().__init__(master, padding=(5, 2))
+        self.title = title
+        self.width = 96
+        self.height = 122
+        self.center_x = self.width / 2
+        self.center_y = self.height - 18
+        self.radius = 42
+
+        self.label_var = tk.StringVar(value=f"{title}  -")
+        ttk.Label(self, textvariable=self.label_var, justify="center", width=12).pack(pady=(0, 2))
+
+        self.canvas = tk.Canvas(
+            self,
+            width=self.width,
+            height=self.height,
+            highlightthickness=0,
+            bg="#f7f7f5",
+        )
+        self.canvas.pack()
+
+        self._draw_static()
+        self.set_value(None)
+
+    def _draw_static(self) -> None:
+        arc_box = (
+            self.center_x - self.radius,
+            self.center_y - self.radius,
+            self.center_x + self.radius,
+            self.center_y + self.radius,
+        )
+        for start_v, end_v, color in [
+            (0.0, 3.3, "#c23b22"),
+            (3.3, 3.5, "#d9a31a"),
+            (3.5, 4.2, "#2d9c5a"),
+            (4.2, 5.0, "#2f6db3"),
+        ]:
+            start_angle = self._angle_from_value(start_v)
+            end_angle = self._angle_from_value(end_v)
+            self.canvas.create_arc(
+                arc_box,
+                start=start_angle,
+                extent=end_angle - start_angle,
+                style="arc",
+                width=6,
+                outline=color,
+            )
+
+        self.canvas.create_arc(arc_box, start=150, extent=240, style="arc", width=2, outline="#4a4a4a")
+
+        for voltage in (0, 1, 2, 3, 4, 5):
+            angle = self._angle_from_value(voltage)
+            inner = self._point_from_angle(angle, self.radius - 7)
+            outer = self._point_from_angle(angle, self.radius + 2)
+            label = self._point_from_angle(angle, self.radius + 11)
+            self.canvas.create_line(*inner, *outer, fill="#6f7782", width=2)
+            self.canvas.create_text(label[0], label[1], text=f"{voltage}", fill="#6f7782", font=("TkDefaultFont", 8))
+
+        self.canvas.create_oval(
+            self.center_x - 4,
+            self.center_y - 4,
+            self.center_x + 4,
+            self.center_y + 4,
+            fill="#303030",
+            outline="",
+        )
+
+    def _angle_from_value(self, value_v: float) -> float:
+        value_v = min(max(value_v, self.SCALE_MIN_V), self.SCALE_MAX_V)
+        ratio = (value_v - self.SCALE_MIN_V) / (self.SCALE_MAX_V - self.SCALE_MIN_V)
+        return 150 - ratio * 240 + self.ROTATION_DEG
+
+    def _point_from_angle(self, angle_deg: float, radius: float) -> tuple[float, float]:
+        angle = math.radians(angle_deg)
+        return (
+            self.center_x + math.cos(angle) * radius,
+            self.center_y - math.sin(angle) * radius,
+        )
+
+    def set_value(self, value_v: Optional[float]) -> None:
+        self.canvas.delete("dynamic")
+
+        if value_v is None or value_v <= 0:
+            self.canvas.create_text(
+                self.center_x,
+                self.center_y - 26,
+                text="OFF",
+                fill="#6b7280",
+                font=("TkDefaultFont", 10, "bold"),
+                tags="dynamic",
+            )
+            self.canvas.create_line(
+                self.center_x,
+                self.center_y,
+                self.center_x - self.radius + 12,
+                self.center_y - 8,
+                fill="#b0b6bf",
+                width=3,
+                tags="dynamic",
+            )
+            self.label_var.set(f"{self.title}  -")
+            return
+
+        angle = self._angle_from_value(value_v)
+        needle = self._point_from_angle(angle, self.radius - 8)
+        self.canvas.create_line(
+            self.center_x,
+            self.center_y,
+            needle[0],
+            needle[1],
+            fill="#202020",
+            width=3,
+            tags="dynamic",
+        )
+        self.canvas.create_text(
+            self.center_x,
+            self.center_y - 26,
+            text=f"{value_v:.3f}V",
+            fill="#202020",
+            font=("TkDefaultFont", 9, "bold"),
+            tags="dynamic",
+        )
+        self.label_var.set(f"{self.title}  {value_v:.3f} V")
 
 
 class SerialWorker(threading.Thread):
@@ -251,6 +382,7 @@ class App:
         self.loaded_frames: list[FrameData] = []
         self.loaded_csv_path: Optional[Path] = None
         self.playback_cursor = 0
+        self.queue_poll_ms = 50
 
         self.history_x: list[int] = []
         self.history_input_v: list[float] = []
@@ -269,7 +401,7 @@ class App:
         self._build_ui()
         self._ensure_csv_header()
         self.refresh_ports()
-        self.root.after(100, self.poll_queue)
+        self.root.after(self.queue_poll_ms, self.poll_queue)
         self.root.after(400, self.redraw_plot_if_needed)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -308,6 +440,8 @@ class App:
 
         grid = ttk.LabelFrame(self.root, text="Live values", padding=10)
         grid.pack(fill="x", padx=10, pady=6)
+        grid.columnconfigure(0, weight=1)
+        grid.columnconfigure(1, weight=0)
 
         self.value_vars = {
             "frame_index": tk.StringVar(value="-"),
@@ -351,11 +485,24 @@ class App:
             ("Cell6", "cell6"),
         ]
 
+        values_frame = ttk.Frame(grid)
+        values_frame.grid(row=0, column=0, sticky="nw")
+
         for i, (label, key) in enumerate(pairs):
             r = i // 3
             c = (i % 3) * 2
-            ttk.Label(grid, text=label + ":").grid(row=r, column=c, sticky="w", padx=(0, 8), pady=2)
-            ttk.Label(grid, textvariable=self.value_vars[key], width=24).grid(row=r, column=c + 1, sticky="w", pady=2)
+            ttk.Label(values_frame, text=label + ":").grid(row=r, column=c, sticky="w", padx=(0, 8), pady=2)
+            ttk.Label(values_frame, textvariable=self.value_vars[key], width=24).grid(row=r, column=c + 1, sticky="w", pady=2)
+
+        gauges_frame = ttk.LabelFrame(grid, text="Cell gauges", padding=8)
+        gauges_frame.grid(row=0, column=1, sticky="ne", padx=(12, 0), pady=(0, 2))
+
+        self.cell_gauges: dict[str, CellGauge] = {}
+        for index in range(1, 7):
+            key = f"cell{index}"
+            gauge = CellGauge(gauges_frame, f"C{index}")
+            gauge.grid(row=0, column=index - 1, padx=2, pady=2, sticky="n")
+            self.cell_gauges[key] = gauge
 
         plot_frame = ttk.LabelFrame(self.root, text="Live history plot", padding=6)
         plot_frame.pack(fill="both", expand=False, padx=10, pady=6)
@@ -383,7 +530,7 @@ class App:
 
         frame_top = ttk.LabelFrame(mid, text="Recent frames", padding=6)
         frame_bottom = ttk.LabelFrame(mid, text="Raw log", padding=6)
-        mid.add(frame_top, weight=3)
+        mid.add(frame_top, weight=1)
         mid.add(frame_bottom, weight=2)
 
         columns = (
@@ -407,7 +554,7 @@ class App:
             "unknown_bin",
         )
 
-        self.tree = ttk.Treeview(frame_top, columns=columns, show="headings", height=14)
+        self.tree = ttk.Treeview(frame_top, columns=columns, show="headings", height=5)
 
         for col, title, width in [
             ("pc_time", "PC time", 90),
@@ -479,6 +626,8 @@ class App:
         self.log.delete("1.0", "end")
         for key in self.value_vars:
             self.value_vars[key].set("-")
+        for gauge in self.cell_gauges.values():
+            gauge.set_value(None)
 
     def start_new_session(self) -> None:
         self.stop_playback()
@@ -785,7 +934,7 @@ class App:
         self.value_vars["capacity"].set(f"{d.mah} mAh" if d.mah is not None else "-")
         self.value_vars["unknown_value"].set(str(d.unknown_value) if d.unknown_value is not None else "-")
         self.value_vars["unknown_value_bin"].set(d.unknown_value_bin)
-        self.value_vars["temp"].set(f"{d.temp_c:.1f} °C ?" if d.temp_c is not None else "-")
+        self.value_vars["temp"].set(f"{d.temp_c:.1f} degC ?" if d.temp_c is not None else "-")
         self.value_vars["status"].set(str(d.status) if d.status is not None else "-")
         self.value_vars["status_bin"].set(d.status_bin)
         self.value_vars["delta"].set(f"{d.cell_delta_v:.3f} V" if d.cell_delta_v is not None else "-")
@@ -795,6 +944,10 @@ class App:
         self.value_vars["cell4"].set(fmt_v(d.cell4_mv))
         self.value_vars["cell5"].set(fmt_v(d.cell5_mv))
         self.value_vars["cell6"].set(fmt_v(d.cell6_mv))
+        for index in range(1, 7):
+            cell_mv = getattr(d, f"cell{index}_mv")
+            cell_v = cell_mv / 1000 if cell_mv is not None and cell_mv > 0 else None
+            self.cell_gauges[f"cell{index}"].set_value(cell_v)
 
     def add_tree_row(self, d: FrameData) -> None:
         self.tree.insert("", 0, values=(
@@ -818,7 +971,7 @@ class App:
             d.unknown_value_bin,
         ))
         children = self.tree.get_children()
-        if len(children) > 200:
+        if len(children) > 5:
             self.tree.delete(children[-1])
 
     def show_frame(self, d: FrameData, write_csv: bool = True, log_raw: bool = True) -> None:
@@ -840,7 +993,23 @@ class App:
         self.log.insert("end", f"INFO: Showing last frame from loaded CSV -> #{d.frame_index}\n")
         self.log.see("end")
 
+    def playback_frame_summary(self, d: FrameData) -> None:
+        self.last_frame = d
+        self.update_live_values(d)
+        self.add_tree_row(d)
+        self.add_history(d)
+
+    def handle_playback_frames(self, frames: list[FrameData]) -> None:
+        if not frames:
+            return
+
+        for frame in frames[:-1]:
+            self.add_history(frame)
+
+        self.playback_frame_summary(frames[-1])
+
     def poll_queue(self) -> None:
+        playback_frames: list[FrameData] = []
         try:
             while True:
                 kind, payload = self.msg_queue.get_nowait()
@@ -857,12 +1026,15 @@ class App:
                     self.status_var.set("Connected")
                     self.show_frame(payload, write_csv=True, log_raw=True)
                 elif kind == "playback_frame":
-                    self.status_var.set(f"Playback running ({self.playback_speed_var.get()})")
-                    self.show_frame(payload, write_csv=False, log_raw=True)
+                    playback_frames.append(payload)
         except queue.Empty:
             pass
 
-        self.root.after(100, self.poll_queue)
+        if playback_frames:
+            self.status_var.set(f"Playback running ({self.playback_speed_var.get()})")
+            self.handle_playback_frames(playback_frames)
+
+        self.root.after(self.queue_poll_ms, self.poll_queue)
 
     def on_close(self) -> None:
         self.disconnect()

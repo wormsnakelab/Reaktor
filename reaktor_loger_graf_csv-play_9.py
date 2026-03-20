@@ -1,22 +1,35 @@
 import csv
+import math
 import queue
 import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 import serial
 import serial.tools.list_ports
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+try:
+    from PIL import Image, ImageDraw, ImageFont, ImageTk
+except ImportError:
+    Image = None
+    ImageDraw = None
+    ImageFont = None
+    ImageTk = None
+
+if TYPE_CHECKING:
+    from PIL.ImageTk import PhotoImage
 
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
 
 BAUD = 115200
+# Charger protocol uses custom CR/LF bytes after +0x60 byte offset.
+# Protokol nabijecky pouziva vlastni CR/LF bajty po posunu +0x60.
 LF = bytes([0x8A])
 CRLF = bytes([0x8D, 0x8A])
 
@@ -65,6 +78,8 @@ class FrameData:
 
     @property
     def cells_mv(self) -> list[int]:
+        # Keep only real cell voltages, ignore empty 0-value positions.
+        # Nechavame jen skutecna napeti clanku, prazdne 0 pozice ignorujeme.
         vals = [
             self.cell1_mv,
             self.cell2_mv,
@@ -95,6 +110,209 @@ class FrameData:
         return f"{self.unknown_value:08b}" if self.unknown_value is not None else "-"
 
 
+class CellGauge(ttk.Frame):
+    SCALE_MIN_V = 0.0
+    SCALE_MAX_V = 5.0
+    ROTATION_DEG = 50.0
+    AA_SCALE = 4
+
+    def __init__(self, master: tk.Misc, title: str):
+        super().__init__(master, padding=(6, 3))
+        self.title = title
+        self.width = 154
+        self.height = 195
+        self.center_x = self.width / 2
+        self.center_y = self.height - 28
+        self.radius = 67
+
+        self.label_var = tk.StringVar(value=f"{title}  -")
+        ttk.Label(self, textvariable=self.label_var, justify="center", width=14).pack(pady=(0, 4))
+        self._photo: Optional["PhotoImage"] = None
+
+        self.canvas = tk.Canvas(
+            self,
+            width=self.width,
+            height=self.height,
+            highlightthickness=0,
+            bg="#f7f7f5",
+        )
+        self.canvas.pack()
+
+        self.set_value(None)
+
+    def _angle_from_value(self, value_v: float) -> float:
+        value_v = min(max(value_v, self.SCALE_MIN_V), self.SCALE_MAX_V)
+        ratio = self._dial_ratio(value_v)
+        return 150 - ratio * 240 + self.ROTATION_DEG
+
+    @staticmethod
+    def _segment_ratio(value_v: float, start_v: float, end_v: float, exponent: float) -> float:
+        if end_v <= start_v:
+            return 0.0
+        local = (value_v - start_v) / (end_v - start_v)
+        local = min(max(local, 0.0), 1.0)
+        return local ** exponent
+
+    def _dial_ratio(self, value_v: float) -> float:
+        # Compress low/high voltage extremes and dedicate most of the dial
+        # to the normal LiPo operating range.
+        # Stlaci krajni casti stupnice a vetsinu ciferniku necha pro bezne
+        # LiPo napeti, kde je pri provozu potreba nejvetsi citelnost.
+        if value_v <= 3.3:
+            return 0.10 * self._segment_ratio(value_v, 0.0, 3.3, 1.7)
+        if value_v <= 3.5:
+            return 0.10 + 0.12 * self._segment_ratio(value_v, 3.3, 3.5, 0.85)
+        if value_v <= 4.2:
+            return 0.22 + 0.66 * self._segment_ratio(value_v, 3.5, 4.2, 0.9)
+        return 0.88 + 0.12 * self._segment_ratio(value_v, 4.2, 5.0, 1.8)
+
+    def _point_from_angle(self, angle_deg: float, radius: float) -> tuple[float, float]:
+        angle = math.radians(angle_deg)
+        return (
+            self.center_x + math.cos(angle) * radius,
+            self.center_y - math.sin(angle) * radius,
+        )
+
+    def _scaled_point(self, angle_deg: float, radius: float) -> tuple[float, float]:
+        x, y = self._point_from_angle(angle_deg, radius)
+        return (x * self.AA_SCALE, y * self.AA_SCALE)
+
+    def _scaled_box(self) -> tuple[float, float, float, float]:
+        return (
+            (self.center_x - self.radius) * self.AA_SCALE,
+            (self.center_y - self.radius) * self.AA_SCALE,
+            (self.center_x + self.radius) * self.AA_SCALE,
+            (self.center_y + self.radius) * self.AA_SCALE,
+        )
+
+    def _render_with_pillow(self, value_v: Optional[float]) -> None:
+        bg = "#f7f7f5"
+        img = Image.new("RGBA", (self.width * self.AA_SCALE, self.height * self.AA_SCALE), bg)
+        draw = ImageDraw.Draw(img)
+        arc_box = self._scaled_box()
+        small_font = ImageFont.load_default()
+        value_font = ImageFont.load_default()
+
+        # Fixed LiPo state bands: red/yellow/green/blue.
+        # Pevna pasma stavu LiPo: cervena/zluta/zelena/modra.
+        for start_v, end_v, color in [
+            (0.0, 3.3, "#c23b22"),
+            (3.3, 3.5, "#d9a31a"),
+            (3.5, 4.2, "#2d9c5a"),
+            (4.2, 5.0, "#2f6db3"),
+        ]:
+            start_angle = self._angle_from_value(start_v)
+            end_angle = self._angle_from_value(end_v)
+            draw.arc(
+                arc_box,
+                start=-start_angle,
+                end=-end_angle,
+                fill=color,
+                width=9 * self.AA_SCALE,
+            )
+
+        draw.arc(
+            arc_box,
+            start=-(150 + self.ROTATION_DEG),
+            end=-(-90 + self.ROTATION_DEG),
+            fill="#4a4a4a",
+            width=2 * self.AA_SCALE,
+        )
+
+        for voltage in (0, 1, 2, 3, 4, 5):
+            angle = self._angle_from_value(voltage)
+            inner = self._scaled_point(angle, self.radius - 10)
+            outer = self._scaled_point(angle, self.radius + 3)
+            label = self._scaled_point(angle, self.radius + 15)
+            draw.line([inner, outer], fill="#6f7782", width=2 * self.AA_SCALE)
+            draw.text((label[0] - 8 * self.AA_SCALE, label[1] - 7 * self.AA_SCALE), str(voltage), fill="#6f7782", font=small_font)
+
+        cx = self.center_x * self.AA_SCALE
+        cy = self.center_y * self.AA_SCALE
+        draw.ellipse((cx - 5 * self.AA_SCALE, cy - 5 * self.AA_SCALE, cx + 5 * self.AA_SCALE, cy + 5 * self.AA_SCALE), fill="#303030")
+
+        if value_v is None or value_v <= 0:
+            draw.text(
+                (cx - 11 * self.AA_SCALE, (self.center_y - 42) * self.AA_SCALE),
+                "OFF",
+                fill="#6b7280",
+                font=value_font,
+            )
+            off_point = (
+                (self.center_x - self.radius + 18) * self.AA_SCALE,
+                (self.center_y - 14) * self.AA_SCALE,
+            )
+            draw.line([(cx, cy), off_point], fill="#b0b6bf", width=4 * self.AA_SCALE)
+        else:
+            angle = self._angle_from_value(value_v)
+            needle = self._scaled_point(angle, self.radius - 10)
+            draw.line([(cx, cy), needle], fill="#202020", width=4 * self.AA_SCALE)
+            draw.text(
+                (cx - 18 * self.AA_SCALE, (self.center_y - 42) * self.AA_SCALE),
+                f"{value_v:.3f}V",
+                fill="#202020",
+                font=value_font,
+            )
+
+        resample = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
+        final = img.resize((self.width, self.height), resample)
+        self._photo = ImageTk.PhotoImage(final)
+        self.canvas.delete("all")
+        self.canvas.create_image(0, 0, image=self._photo, anchor="nw")
+
+    def _render_with_canvas(self, value_v: Optional[float]) -> None:
+        self.canvas.delete("all")
+        arc_box = (
+            self.center_x - self.radius,
+            self.center_y - self.radius,
+            self.center_x + self.radius,
+            self.center_y + self.radius,
+        )
+
+        for start_v, end_v, color in [
+            (0.0, 3.3, "#c23b22"),
+            (3.3, 3.5, "#d9a31a"),
+            (3.5, 4.2, "#2d9c5a"),
+            (4.2, 5.0, "#2f6db3"),
+        ]:
+            start_angle = self._angle_from_value(start_v)
+            end_angle = self._angle_from_value(end_v)
+            self.canvas.create_arc(arc_box, start=start_angle, extent=end_angle - start_angle, style="arc", width=9, outline=color)
+
+        self.canvas.create_arc(arc_box, start=150 + self.ROTATION_DEG, extent=240, style="arc", width=2, outline="#4a4a4a")
+
+        for voltage in (0, 1, 2, 3, 4, 5):
+            angle = self._angle_from_value(voltage)
+            inner = self._point_from_angle(angle, self.radius - 10)
+            outer = self._point_from_angle(angle, self.radius + 3)
+            label = self._point_from_angle(angle, self.radius + 15)
+            self.canvas.create_line(*inner, *outer, fill="#6f7782", width=2)
+            self.canvas.create_text(label[0], label[1], text=f"{voltage}", fill="#6f7782", font=("TkDefaultFont", 10))
+
+        self.canvas.create_oval(self.center_x - 5, self.center_y - 5, self.center_x + 5, self.center_y + 5, fill="#303030", outline="")
+
+        if value_v is None or value_v <= 0:
+            self.canvas.create_text(self.center_x, self.center_y - 42, text="OFF", fill="#6b7280", font=("TkDefaultFont", 12, "bold"))
+            self.canvas.create_line(self.center_x, self.center_y, self.center_x - self.radius + 18, self.center_y - 14, fill="#b0b6bf", width=4)
+            return
+
+        angle = self._angle_from_value(value_v)
+        needle = self._point_from_angle(angle, self.radius - 10)
+        self.canvas.create_line(self.center_x, self.center_y, needle[0], needle[1], fill="#202020", width=4)
+        self.canvas.create_text(self.center_x, self.center_y - 42, text=f"{value_v:.3f}V", fill="#202020", font=("TkDefaultFont", 11, "bold"))
+
+    def set_value(self, value_v: Optional[float]) -> None:
+        if value_v is None or value_v <= 0:
+            self.label_var.set(f"{self.title}  -")
+        else:
+            self.label_var.set(f"{self.title}  {value_v:.3f} V")
+
+        if Image is not None and ImageDraw is not None and ImageTk is not None:
+            self._render_with_pillow(value_v)
+        else:
+            self._render_with_canvas(value_v)
+
+
 class SerialWorker(threading.Thread):
     def __init__(self, port: str, out_queue: queue.Queue):
         super().__init__(daemon=True)
@@ -115,6 +333,8 @@ class SerialWorker(threading.Thread):
 
     @staticmethod
     def decode_frame(payload: bytes) -> str:
+        # Charger sends printable bytes shifted by +0x60.
+        # Nabijecka posila tisknutelne znaky posunute o +0x60.
         return "".join(
             chr(b - 0x60) if 32 <= (b - 0x60) <= 126 else "."
             for b in payload
@@ -251,6 +471,7 @@ class App:
         self.loaded_frames: list[FrameData] = []
         self.loaded_csv_path: Optional[Path] = None
         self.playback_cursor = 0
+        self.queue_poll_ms = 50
 
         self.history_x: list[int] = []
         self.history_input_v: list[float] = []
@@ -269,7 +490,7 @@ class App:
         self._build_ui()
         self._ensure_csv_header()
         self.refresh_ports()
-        self.root.after(100, self.poll_queue)
+        self.root.after(self.queue_poll_ms, self.poll_queue)
         self.root.after(400, self.redraw_plot_if_needed)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -308,6 +529,8 @@ class App:
 
         grid = ttk.LabelFrame(self.root, text="Live values", padding=10)
         grid.pack(fill="x", padx=10, pady=6)
+        grid.columnconfigure(0, weight=1)
+        grid.columnconfigure(1, weight=0)
 
         self.value_vars = {
             "frame_index": tk.StringVar(value="-"),
@@ -351,11 +574,24 @@ class App:
             ("Cell6", "cell6"),
         ]
 
+        values_frame = ttk.Frame(grid)
+        values_frame.grid(row=0, column=0, sticky="nw")
+
         for i, (label, key) in enumerate(pairs):
             r = i // 3
             c = (i % 3) * 2
-            ttk.Label(grid, text=label + ":").grid(row=r, column=c, sticky="w", padx=(0, 8), pady=2)
-            ttk.Label(grid, textvariable=self.value_vars[key], width=24).grid(row=r, column=c + 1, sticky="w", pady=2)
+            ttk.Label(values_frame, text=label + ":").grid(row=r, column=c, sticky="w", padx=(0, 8), pady=2)
+            ttk.Label(values_frame, textvariable=self.value_vars[key], width=24).grid(row=r, column=c + 1, sticky="w", pady=2)
+
+        gauges_frame = ttk.LabelFrame(grid, text="Cell gauges", padding=10)
+        gauges_frame.grid(row=0, column=1, sticky="ne", padx=(12, 0), pady=(0, 2))
+
+        self.cell_gauges: dict[str, CellGauge] = {}
+        for index in range(1, 7):
+            key = f"cell{index}"
+            gauge = CellGauge(gauges_frame, f"C{index}")
+            gauge.grid(row=0, column=index - 1, padx=4, pady=2, sticky="n")
+            self.cell_gauges[key] = gauge
 
         plot_frame = ttk.LabelFrame(self.root, text="Live history plot", padding=6)
         plot_frame.pack(fill="both", expand=False, padx=10, pady=6)
@@ -383,7 +619,7 @@ class App:
 
         frame_top = ttk.LabelFrame(mid, text="Recent frames", padding=6)
         frame_bottom = ttk.LabelFrame(mid, text="Raw log", padding=6)
-        mid.add(frame_top, weight=3)
+        mid.add(frame_top, weight=1)
         mid.add(frame_bottom, weight=2)
 
         columns = (
@@ -407,7 +643,7 @@ class App:
             "unknown_bin",
         )
 
-        self.tree = ttk.Treeview(frame_top, columns=columns, show="headings", height=14)
+        self.tree = ttk.Treeview(frame_top, columns=columns, show="headings", height=5)
 
         for col, title, width in [
             ("pc_time", "PC time", 90),
@@ -479,6 +715,8 @@ class App:
         self.log.delete("1.0", "end")
         for key in self.value_vars:
             self.value_vars[key].set("-")
+        for gauge in self.cell_gauges.values():
+            gauge.set_value(None)
 
     def start_new_session(self) -> None:
         self.stop_playback()
@@ -785,7 +1023,7 @@ class App:
         self.value_vars["capacity"].set(f"{d.mah} mAh" if d.mah is not None else "-")
         self.value_vars["unknown_value"].set(str(d.unknown_value) if d.unknown_value is not None else "-")
         self.value_vars["unknown_value_bin"].set(d.unknown_value_bin)
-        self.value_vars["temp"].set(f"{d.temp_c:.1f} °C ?" if d.temp_c is not None else "-")
+        self.value_vars["temp"].set(f"{d.temp_c:.1f} degC ?" if d.temp_c is not None else "-")
         self.value_vars["status"].set(str(d.status) if d.status is not None else "-")
         self.value_vars["status_bin"].set(d.status_bin)
         self.value_vars["delta"].set(f"{d.cell_delta_v:.3f} V" if d.cell_delta_v is not None else "-")
@@ -795,6 +1033,10 @@ class App:
         self.value_vars["cell4"].set(fmt_v(d.cell4_mv))
         self.value_vars["cell5"].set(fmt_v(d.cell5_mv))
         self.value_vars["cell6"].set(fmt_v(d.cell6_mv))
+        for index in range(1, 7):
+            cell_mv = getattr(d, f"cell{index}_mv")
+            cell_v = cell_mv / 1000 if cell_mv is not None and cell_mv > 0 else None
+            self.cell_gauges[f"cell{index}"].set_value(cell_v)
 
     def add_tree_row(self, d: FrameData) -> None:
         self.tree.insert("", 0, values=(
@@ -818,7 +1060,7 @@ class App:
             d.unknown_value_bin,
         ))
         children = self.tree.get_children()
-        if len(children) > 200:
+        if len(children) > 5:
             self.tree.delete(children[-1])
 
     def show_frame(self, d: FrameData, write_csv: bool = True, log_raw: bool = True) -> None:
@@ -840,7 +1082,27 @@ class App:
         self.log.insert("end", f"INFO: Showing last frame from loaded CSV -> #{d.frame_index}\n")
         self.log.see("end")
 
+    def playback_frame_summary(self, d: FrameData) -> None:
+        # During playback we fully redraw only the newest frame in a batch.
+        # Pri playbacku plne prekreslujeme jen posledni frame z davky.
+        self.last_frame = d
+        self.update_live_values(d)
+        self.add_tree_row(d)
+        self.add_history(d)
+
+    def handle_playback_frames(self, frames: list[FrameData]) -> None:
+        if not frames:
+            return
+
+        # Older frames go straight to history to keep fast playback smooth.
+        # Starsi framy jdou rovnou do historie, aby rychly playback nepadal.
+        for frame in frames[:-1]:
+            self.add_history(frame)
+
+        self.playback_frame_summary(frames[-1])
+
     def poll_queue(self) -> None:
+        playback_frames: list[FrameData] = []
         try:
             while True:
                 kind, payload = self.msg_queue.get_nowait()
@@ -857,12 +1119,15 @@ class App:
                     self.status_var.set("Connected")
                     self.show_frame(payload, write_csv=True, log_raw=True)
                 elif kind == "playback_frame":
-                    self.status_var.set(f"Playback running ({self.playback_speed_var.get()})")
-                    self.show_frame(payload, write_csv=False, log_raw=True)
+                    playback_frames.append(payload)
         except queue.Empty:
             pass
 
-        self.root.after(100, self.poll_queue)
+        if playback_frames:
+            self.status_var.set(f"Playback running ({self.playback_speed_var.get()})")
+            self.handle_playback_frames(playback_frames)
+
+        self.root.after(self.queue_poll_ms, self.poll_queue)
 
     def on_close(self) -> None:
         self.disconnect()
